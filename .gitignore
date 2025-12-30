@@ -1,0 +1,15 @@
+node_modules/
+*.db
+*.sqlite
+*.sqlite3
+gst_cache.json
+browser-cookies.json
+browser-session/
+.env
+.DS_Store
+*.log
+debug-*.png
+error-*.png
+debug-*.html
+error-*.html
+
