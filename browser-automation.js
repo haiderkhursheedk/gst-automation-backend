@@ -11,6 +11,9 @@ class GSTBrowserAutomation {
     this.isInitialized = false;
     this.sessionPath = path.join(__dirname, 'browser-session');
     this.cookiesPath = path.join(__dirname, 'browser-cookies.json');
+    this.apiResponse = null;
+    this.goodsServiceResponse = null;
+    this.responseHandler = null;
   }
 
   getPlatformUserAgent() {
@@ -30,10 +33,10 @@ class GSTBrowserAutomation {
       return;
     }
 
-    console.log('Launching browser (non-headless mode)...');
+    console.log('Launching browser (headless mode)...');
     
     this.browser = await chromium.launch({
-      headless: false,
+      headless: true,
       slowMo: 100,
       args: [
         '--disable-blink-features=AutomationControlled',
@@ -83,336 +86,187 @@ class GSTBrowserAutomation {
     }
   }
 
-  async waitForCaptchaToBeSolved(maxWaitTime = 300000) {
-    console.log('\n🔍 Checking for CAPTCHA...');
-    
-    const startTime = Date.now();
-    const checkInterval = 2000;
-    let captchaDetected = false;
-    let lastStatusTime = startTime;
-    
-    while (Date.now() - startTime < maxWaitTime) {
-      try {
-        const captchaSelectors = [
-          'iframe[src*="recaptcha"]',
-          'iframe[src*="captcha"]',
-          '.g-recaptcha',
-          '#captcha',
-          '[class*="captcha"]',
-          '[id*="captcha"]',
-          'div[data-sitekey]',
-          '.recaptcha-checkbox',
-          '[class*="recaptcha"]'
-        ];
+  setupResponseListener() {
+    this.apiResponse = null;
+    this.goodsServiceResponse = null;
 
-        let captchaFound = false;
-        for (const selector of captchaSelectors) {
-          try {
-            const element = await this.page.$(selector);
-            if (element) {
-              const isVisible = await element.isVisible().catch(() => false);
-              if (isVisible) {
-                captchaFound = true;
-                break;
-              }
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-
-        if (!captchaFound) {
-          try {
-            const pageText = await this.page.textContent('body').catch(() => '');
-            if (pageText.toLowerCase().includes('captcha') || 
-                pageText.toLowerCase().includes('verify you are human') ||
-                pageText.toLowerCase().includes('i\'m not a robot')) {
-              captchaFound = true;
-            }
-          } catch (e) {
-          }
-        }
-
-        if (captchaFound && !captchaDetected) {
-          captchaDetected = true;
-          console.log('⚠️  CAPTCHA detected! Please solve it in the browser window.');
-          console.log('💡 Once solved, the session will be saved for future requests.');
-        }
-
-        if (!captchaFound) {
-          const inputSelectors = [
-            'input[name="gstin"]',
-            'input[id="gstin"]',
-            '#gstin',
-            'input[type="text"]'
-          ];
-          
-          let canProceed = false;
-          for (const selector of inputSelectors) {
-            try {
-              const input = await this.page.$(selector);
-              if (input) {
-                const isDisabled = await input.isDisabled().catch(() => true);
-                const isVisible = await input.isVisible().catch(() => false);
-                if (!isDisabled && isVisible) {
-                  canProceed = true;
-                  break;
-                }
-              }
-            } catch (e) {
-              continue;
-            }
-          }
-
-          if (canProceed) {
-            if (captchaDetected) {
-              console.log('✅ CAPTCHA solved! Waiting for page to stabilize...');
-              await this.page.waitForTimeout(2000);
-              
-              try {
-                await this.page.waitForLoadState('networkidle', { timeout: 8000 });
-              } catch (e) {
-                console.log('Waiting for page to finish loading...');
-              }
-              
-              await this.page.waitForTimeout(2000);
-              console.log('Page stabilized. Proceeding with form fill...');
-            } else {
-              console.log('✅ No CAPTCHA detected. Proceeding...');
-            }
-            await this.saveCookies();
-            return captchaDetected;
-          }
-        }
-
-        if (captchaDetected && Date.now() - lastStatusTime > 10000) {
-          const elapsed = Math.floor((Date.now() - startTime) / 1000);
-          console.log(`⏳ Still waiting... (${elapsed}s elapsed)`);
-          lastStatusTime = Date.now();
-        }
-
-        await this.page.waitForTimeout(checkInterval);
-      } catch (error) {
-        await this.page.waitForTimeout(checkInterval);
-      }
+    if (this.responseHandler) {
+      this.page.off('response', this.responseHandler);
     }
 
-    console.log('⏱️  Timeout waiting for CAPTCHA. Proceeding anyway...');
-    await this.saveCookies();
-    return false;
+    this.responseHandler = async (response) => {
+      const url = response.url();
+      if (url.includes('/api/search/taxpayerDetails')) {
+        try {
+          const json = await response.json();
+          this.apiResponse = json;
+          console.log('Intercepted taxpayerDetails API response');
+        } catch (e) {
+          console.log('Could not parse API response:', e.message);
+        }
+      } else if (url.includes('/api/search/goodservice')) {
+        try {
+          const json = await response.json();
+          this.goodsServiceResponse = json;
+          console.log('Intercepted goodservice API response');
+        } catch (e) {
+          console.log('Could not parse goodservice API response:', e.message);
+        }
+      }
+    };
+
+    this.page.on('response', this.responseHandler);
   }
 
-  async verifyGSTIN(gstin, retries = 3) {
+  cleanupResponseListener() {
+    if (this.responseHandler) {
+      this.page.off('response', this.responseHandler);
+      this.responseHandler = null;
+    }
+  }
+
+  async getCaptchaImage() {
+    try {
+      const selectors = ['#imgCaptcha', 'img.captcha', 'img[src*="captcha"]'];
+      let captchaElement = null;
+      
+      for (const selector of selectors) {
+        captchaElement = await this.page.$(selector);
+        if (captchaElement && await captchaElement.isVisible()) {
+          break;
+        }
+      }
+
+      if (captchaElement) {
+        // Scroll into view
+        await captchaElement.scrollIntoViewIfNeeded();
+        const buffer = await captchaElement.screenshot({ type: 'png' });
+        return `data:image/png;base64,${buffer.toString('base64')}`;
+      }
+      return null;
+    } catch (e) {
+      console.error('Error capturing CAPTCHA:', e.message);
+      return null;
+    }
+  }
+
+  async initiateSearch(gstin) {
     if (!this.isInitialized || !this.browser || !this.page || this.page.isClosed()) {
       console.log('Browser not initialized or closed. Reinitializing...');
       await this.initialize();
     }
+    
+    if (this.page.isClosed()) {
+        await this.initialize();
+    }
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        if (!this.page || this.page.isClosed()) {
-          console.log('Page closed, reinitializing...');
-          await this.initialize();
-        }
-        
-        console.log(`Verifying GSTIN: ${gstin} (Attempt ${attempt}/${retries})`);
-        
-        let apiResponse = null;
-        let goodsServiceResponse = null;
-        let responseReceived = false;
-        
-        const responseHandler = async (response) => {
-          const url = response.url();
-          if (url.includes('/api/search/taxpayerDetails')) {
-            try {
-              const json = await response.json();
-              apiResponse = json;
-              responseReceived = true;
-              console.log('✅ Intercepted taxpayerDetails API response');
-            } catch (e) {
-              console.log('Could not parse API response:', e.message);
-            }
-          } else if (url.includes('/api/search/goodservice')) {
-            try {
-              const json = await response.json();
-              goodsServiceResponse = json;
-              console.log('✅ Intercepted goodservice API response');
-            } catch (e) {
-              console.log('Could not parse goodservice API response:', e.message);
-            }
-          }
-        };
-        
-        this.page.on('response', responseHandler);
-        
-        const gstSearchUrl = 'https://services.gst.gov.in/services/searchtp';
+    this.setupResponseListener();
+    const gstSearchUrl = 'https://services.gst.gov.in/services/searchtp';
+    
+    try {
         console.log('Navigating to GST portal...');
+        await this.page.goto(gstSearchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         
-        try {
-          await this.page.goto(gstSearchUrl, { 
-            waitUntil: 'domcontentloaded',
-            timeout: 60000 
-          });
-        } catch (navError) {
-          if (attempt < retries) {
-            console.log(`Navigation failed, retrying... (${navError.message})`);
-            await this.page.waitForTimeout(3000);
-            continue;
-          }
-          throw navError;
-        }
-
-        console.log('Waiting 5 seconds for page to fully load...');
+        // User requested wait for page setup
+        console.log('Waiting 5 seconds for page initialization...');
         await this.page.waitForTimeout(5000);
         
-        try {
-          await this.page.waitForLoadState('networkidle', { timeout: 5000 });
-        } catch (e) {
-          console.log('Page may still be loading, continuing...');
+        const inputSelector = '#for_gstin, input[name="for_gstin"], #gstin';
+        await this.page.waitForSelector(inputSelector, { state: 'visible', timeout: 10000 });
+        
+        const input = await this.page.$(inputSelector);
+        if (!input) throw new Error('GSTIN input field not found');
+        
+        // Enter GSTIN and trigger events
+        console.log('Entering GSTIN...');
+        await input.fill(gstin);
+        await this.page.waitForTimeout(500);
+        await input.click(); 
+        await input.press('End');
+        await this.page.keyboard.press('Space');
+        await this.page.keyboard.press('Backspace');
+        
+        console.log('Checking for CAPTCHA...');
+        await this.page.waitForTimeout(2000); 
+        
+        const captchaImage = await this.getCaptchaImage();
+        
+        if (captchaImage) {
+            console.log('CAPTCHA detected, returning image to client');
+            return { status: 'captcha_required', captcha_image: captchaImage };
         }
+        
+        console.log('No CAPTCHA detected, attempting to search directly...');
+        return await this.performSearch(gstin);
 
-      const inputSelectors = [
-        'input[name="for_gstin"]',
-        'input[id="for_gstin"]',
-        '#for_gstin',
-        'input[name="gstin"]',
-        'input[id="gstin"]',
-        'input[placeholder*="GSTIN"]',
-        'input[type="text"]',
-        '#gstin',
-        'input.form-control',
-        'input[class*="gstin"]'
-      ];
+    } catch (error) {
+        console.error('Error in initiateSearch:', error);
+        throw error;
+    }
+  }
 
-      let inputFound = false;
-      let inputElement = null;
-
-      for (const selector of inputSelectors) {
-        try {
-          await this.page.waitForSelector(selector, { timeout: 10000, state: 'visible' });
-          inputElement = await this.page.$(selector);
-          if (inputElement) {
-            const isVisible = await inputElement.isVisible().catch(() => false);
-            const isEnabled = await inputElement.isEnabled().catch(() => false);
-            if (isVisible && isEnabled) {
-              inputFound = true;
-              console.log(`Found input field with selector: ${selector}`);
-              break;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
+  async submitCaptcha(solution) {
+      if (!this.page || this.page.isClosed()) {
+          throw new Error('Browser session expired or closed. Please start over.');
       }
-
-      if (!inputFound) {
-        if (!this.page || this.page.isClosed()) {
-          console.log('Page closed during input search, reinitializing...');
-          await this.initialize();
-          if (attempt < retries) {
-            await this.page.waitForTimeout(2000);
-            continue;
-          }
-        }
-        const path = require('path');
-        const screenshotPath = path.join(__dirname, 'debug-screenshot.png');
-        try {
-          await this.page.screenshot({ path: screenshotPath });
-        } catch (e) {
-          console.log('Could not take screenshot:', e.message);
-        }
-        throw new Error(`Could not find GSTIN input field. Screenshot saved as ${screenshotPath}`);
-      }
-
-      console.log('Filling GSTIN field...');
-      await inputElement.click();
-      await this.page.waitForTimeout(300);
-      await inputElement.fill('');
-      await this.page.waitForTimeout(200);
-      await inputElement.fill(gstin);
-      await this.page.waitForTimeout(2000);
       
-      console.log('Checking if CAPTCHA is loaded...');
-      const captchaLabel = await this.page.$('label[for="fo-captcha"], label:has-text("Type the characters")').catch(() => null);
-      const captchaInput = await this.page.$('#fo-captcha, input[name="cap"]').catch(() => null);
-      const captchaImage = await this.page.$('#imgCaptcha, img.captcha').catch(() => null);
-      
-      if (captchaLabel || captchaInput || captchaImage) {
-        console.log('⚠️  CAPTCHA detected! Please fill the CAPTCHA in the browser window.');
-        console.log('💡 Waiting for you to solve the CAPTCHA...');
-        await this.waitForCaptchaToBeSolved();
-      } else {
-        console.log('✅ No CAPTCHA detected, proceeding with search...');
+      try {
+          console.log(`Submitting CAPTCHA solution: ${solution}`);
+          const captchaInput = await this.page.$('#fo-captcha, input[name="cap"], #captcha');
+          if (captchaInput) {
+              await captchaInput.fill(solution);
+          } else {
+              console.log('CAPTCHA input not found, might have disappeared or not needed.');
+          }
+          
+          return await this.performSearch();
+      } catch (error) {
+          console.error('Error in submitCaptcha:', error);
+          throw error;
       }
+  }
 
-      const buttonSelectors = [
-        'button[id="lotsearch"]',
-        '#lotsearch',
-        'button[type="submit"]',
-        'button:has-text("Search")',
-        'button:has-text("SEARCH")',
-        'input[type="submit"]',
-        'button.btn-primary',
-        'button[class*="search"]',
-        '#search',
-        '.search-btn'
-      ];
-
-      let buttonFound = false;
+  async performSearch(gstin = null) {
+      const buttonSelectors = ['#lotsearch', 'button[type="submit"]', 'button:has-text("Search")'];
+      let button = null;
+      
       for (const selector of buttonSelectors) {
-        try {
-          const button = await this.page.$(selector);
-          if (button) {
-            buttonFound = true;
-            console.log(`Found button with selector: ${selector}`);
-            await button.click();
-            break;
-          }
-        } catch (e) {
-          continue;
-        }
+          button = await this.page.$(selector);
+          if (button) break;
       }
-
-      if (!buttonFound) {
-        console.log('Button not found, trying Enter key...');
-        await inputElement.press('Enter');
+      
+      if (button) {
+          await button.click();
+      } else {
+          await this.page.keyboard.press('Enter');
       }
+      
+      return await this.waitForResults(gstin);
+  }
 
-      console.log('Search button clicked. Waiting for API responses...');
-      
-      await this.page.waitForTimeout(2000);
-      
-      console.log('Waiting for taxpayerDetails and goodservice API calls...');
-      
+  async waitForResults(gstin) {
+      console.log('Waiting for API responses...');
       const maxWaitTime = 15000;
       const startTime = Date.now();
       
-      while (!responseReceived && (Date.now() - startTime < maxWaitTime)) {
-        if (apiResponse) {
-          console.log('✅ API response received!');
-          break;
-        }
-        await this.page.waitForTimeout(1000);
+      while (!this.apiResponse && (Date.now() - startTime < maxWaitTime)) {
+          await this.page.waitForTimeout(500);
+          
+          const errorMsg = await this.page.$eval('.error-msg, .alert-danger', el => el.textContent).catch(() => null);
+          if (errorMsg) {
+              throw new Error(`GST Portal Error: ${errorMsg.trim()}`);
+          }
       }
       
-      await this.page.waitForTimeout(2000);
-      
-      if (!apiResponse) {
-        console.log('❌ API response not received within 15 seconds.');
-        console.log('⚠️  Please refresh the page in the browser and try again.');
-        this.page.off('response', responseHandler);
-        if (attempt < retries) {
-          await this.page.waitForTimeout(5000);
-          continue;
-        }
-        throw new Error('Search results not found. Please refresh the page and retry the request.');
+      if (!this.apiResponse) {
+          throw new Error('Timeout waiting for GST details. CAPTCHA might be incorrect or service unavailable.');
       }
       
-      this.page.off('response', responseHandler);
-      
-      console.log('Extracting data from API response...');
-      
-      const extractedData = {
+      return this.extractDataFromResponse(this.apiResponse, this.goodsServiceResponse, gstin);
+  }
+
+  extractDataFromResponse(apiResponse, goodsServiceResponse, gstin) {
+       const extractedData = {
         legal_name: apiResponse.lgnm || null,
         trade_name: apiResponse.tradeNam || null,
         address: apiResponse.pradr?.adr || null,
@@ -436,46 +290,8 @@ class GSTBrowserAutomation {
         goods_services: goodsServiceResponse?.bzgddtls || null
       };
       
-      console.log('Extracted data:', JSON.stringify(extractedData, null, 2));
-
-      if (!extractedData.legal_name && !extractedData.trade_name && !extractedData.address) {
-        if (attempt < retries) {
-          console.log('No data in API response, retrying...');
-          await this.page.waitForTimeout(5000);
-          continue;
-        }
-        throw new Error('Could not extract GST data from API. Please refresh the page in the browser and retry the request.');
-      }
-
-        await this.saveCookies();
-
-        return extractedData;
-
-      } catch (error) {
-        console.error(`Error during GST verification (Attempt ${attempt}/${retries}):`, error.message);
-        
-        if (attempt === retries) {
-          try {
-            const path = require('path');
-            const fs = require('fs');
-            const timestamp = Date.now();
-            const screenshotPath = path.join(__dirname, `error-screenshot-${timestamp}.png`);
-            const htmlPath = path.join(__dirname, `error-page-${timestamp}.html`);
-            await this.page.screenshot({ path: screenshotPath, fullPage: true });
-            const html = await this.page.content();
-            fs.writeFileSync(htmlPath, html);
-            console.log(`Debug files saved for inspection: ${screenshotPath}, ${htmlPath}`);
-          } catch (debugError) {
-            console.error('Could not save debug files:', debugError.message);
-          }
-          throw error;
-        }
-        
-        await this.page.waitForTimeout(5000);
-      }
-    }
-    
-    throw new Error('All retry attempts failed');
+      this.cleanupResponseListener();
+      return extractedData;
   }
 
   async extractGSTData() {
@@ -735,4 +551,3 @@ class GSTBrowserAutomation {
 }
 
 module.exports = GSTBrowserAutomation;
-
