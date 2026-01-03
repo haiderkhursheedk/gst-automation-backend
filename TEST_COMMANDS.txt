@@ -1,9 +1,8 @@
-# 1. Get Info (and Captcha)
-# On Windows PowerShell:
 $response = Invoke-RestMethod -Uri "https://gst-automation-backend.vercel.app/info" -Method Post -ContentType "application/json" -Body '{"gstin": "27BEVPK8479R1ZX"}'
-# Save Captcha to file if it exists
+
 if ($response.status -eq "captcha_required") {
-    $bytes = [Convert]::FromBase64String($response.captcha_image -replace '^data:image/png;base64,', '')
+    $base64 = $response.captcha_image -replace '^data:image/png;base64,', ''
+    $bytes = [Convert]::FromBase64String($base64)
     [IO.File]::WriteAllBytes("captcha_received.png", $bytes)
     Write-Host "Captcha saved to captcha_received.png"
 } else {
